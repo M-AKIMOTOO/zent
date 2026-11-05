@@ -10,3 +10,6 @@ __pycache__/
 /zent_*_send.sh
 /zent_*_recv.sh
 /zent_*_manifest.tsv
+
+# Local implementation guide
+/fasttransfer_implementation_guide_RHEL6_RHEL8.txt
