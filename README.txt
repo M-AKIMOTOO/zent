@@ -100,8 +100,9 @@ connection. Data is neither authenticated, encrypted nor checksummed. Restrict
 the bind address and firewall to a trusted network; run unprivileged. A byte
 count does not detect corrupted data. Verify with an external hash as needed.
 
-make test runs local functional and error tests with Python 3; Python is not
-needed to build or run the tools. Test real RHEL systems, storage, network and
-representative data before production use; performance is workload-dependent.
+If the optional local test files are present, make test runs them with Python 3.
+They are not included in this repository. Python is not needed to build or run
+zent itself. Test real RHEL systems, storage, network and representative data
+before production use; performance is workload-dependent.
 
 For DRG schedule-based script generation, see README_DRG.md.

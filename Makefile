@@ -19,6 +19,7 @@ install: zent
 	$(INSTALL) -m 755 mkzent.py "$(BINDIR)/mkzent.py"
 
 test: all
+	@test -f tests.py -a -f test_schedule.py || { echo "Local test files are not present; they are not included in this repository." >&2; exit 1; }
 	python3 tests.py
 	python3 test_schedule.py
 

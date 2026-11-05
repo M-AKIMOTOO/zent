@@ -13,3 +13,7 @@ __pycache__/
 
 # Local implementation guide
 /fasttransfer_implementation_guide_RHEL6_RHEL8.txt
+
+# Local tests
+/tests.py
+/test_schedule.py
