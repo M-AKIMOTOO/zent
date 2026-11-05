@@ -1,0 +1,12 @@
+# Compiled files
+/zent
+*.o
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated transfer scripts and manifests
+/zent_*_send.sh
+/zent_*_recv.sh
+/zent_*_manifest.tsv

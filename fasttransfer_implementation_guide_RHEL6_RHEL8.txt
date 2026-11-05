@@ -1,0 +1,368 @@
+高速RAWデータ転送ツール 作成手順書
+====================================
+版: 1.0
+作成日: 2026-11-01
+想定対象: Sender (Linux 2.6.32 / GCC 4.4.7) → Receiver (Linux 4.18 / GCC 8.5.0)
+
+0. 目的と前提
+--------------
+目的:
+  ・巨大なRAWファイルの任意のバイト位置から正確に指定長を切り出して送信する。
+  ・従来の「dd | tail | pv | ncat」よりもCPU使用時間と余計なコピーを削減する。
+  ・可能な範囲で転送速度を安定させ、実効速度を改善する。
+  ・送受信バイト数の検証、途中切断の検知、受信ファイルの安全な確定を実装する。
+
+環境:
+  Sender:
+    GCC 4.4.7 (Red Hat 4.4.7-18)
+    Linux 2.6.32-696.el6.x86_64
+    CPU: 2コア
+    RAM: 32 GB（約10 GBは別用途。OSおよび他の処理用の余裕も必要）
+  Receiver:
+    GCC 8.5.0 (Red Hat 8.5.0-23)
+    Linux 4.18.0-553.42.1.el8_10.x86_64
+  通信:
+    信頼できるローカルネットワーク内のTCP。データは暗号化しない。
+    SSH接続は起動・管理のみ。SSHトンネル内にデータ本体を流さない。
+    10GbEを想定するが、実際のリンク速度を事前に確認する。
+
+重要:
+  ・RAMの経由をなくすのではなく、ユーザー空間への不要なコピーを減らす。
+  ・『先読み量 = 確実にRAMへ保持される量』ではない。
+  ・最終的な持続転送速度はHDD/RAID、NIC、受信側書き込みの最も遅い部分に制限される。
+  ・この文書は作成の手順書であり、完成したソースコードではない。
+
+1. アーキテクチャ
+------------------
+送信: HDD/RAID → ページキャッシュ → sendfile() → TCPソケット
+受信: TCPソケット → splice(socket→pipe→file) → 受信ファイル
+
+Senderは単一プロセス・単一スレッド・ブロッキングI/O。
+Receiverも当初は単一プロセス・単一スレッド・ブロッキングI/O。
+通信・データは非圧縮・非暗号化。データ部分をアプリケーションの大きな
+mallocバッファへコピーしない構成を優先する。
+
+Receiver側のsplice()が利用できない場合や性能が劣る場合は、
+recv() + write() にフォールバックできるよう実装する。
+その場合は例えば1 MiB程度の固定長ユーザーバッファを使用する。
+比較を公平にするためフォールバックも明示的に選べるようにする。
+
+2. ソース構成（推奨）
+----------------------
+fastsend.c       : 送信側CLI、ファイル範囲検証、sendfile、進捗
+fastrecv.c       : 受信側CLI、ソケット待受、splice、ファイル確定
+protocol.h       : 通信プロトコル定義、固定長ヘッダー
+common.c/.h      : 64bit数値パース、時刻、エラー、read_full/write_fullなど
+Makefile         : GCC 4.4.7でも動作するビルド設定
+README.txt       : 利用手順および安全上の注意
+
+最初はsourceを2本（fastsend.c / fastrecv.c）にまとめてもよい。
+外部ライブラリには依存させず、glibc / Linux標準APIのみ使用する。
+
+3. 必須CLIの仕様
+-----------------
+受信側（Receiverで実行）:
+  ./fastrecv --bind 192.168.10.2 --port 9002 --output /data/output.raw
+
+送信側（Sender上で実行）:
+  ./fastsend --input /data/source.raw --offset 604248 \
+    --length 153600000000 --host 192.168.10.2 --port 9002
+
+追加オプション案:
+  --progress-sec 1       : 進捗表示周期。0は無効
+  --readahead auto|off   : デフォルトauto（カーネル標準の先読み）
+  --prefetch-mib N       : 試験用の明示的な先読み窓（0, 32, 128, 512等）
+  --send-chunk-mib N     : 1回のsendfile要求量（初期値16）
+  --receive-mode splice|rw  : 受信モード（初期値splice）
+  --fsync                : 受信完了後にfdatasync/fsyncで永続化確認
+  --no-progress          : 進捗表示無効
+
+安全のため、受信先パスはSenderから自由に指定させず、ReceiverのCLI引数で指定。
+Receiverは1回の実行で原則1ファイルだけを受信して終了。
+リモート側で任意コマンドを実行する機能は実装しない。
+
+4. 転送プロトコルと正確な転送長
+--------------------------------
+TCPはストリームであり、send()1回とrecv()1回の単位は一致しない。
+ヘッダーは「ちょうど指定バイト数を読み取る」ループで受信する。
+
+最低限の固定長ヘッダー（例: 32 bytes）をバージョン付きで定義:
+  bytes 0-7    Magic ASCII（例: FASTRAW1）
+  bytes 8-11   Protocol version (network byte order, u32)
+  bytes 12-15  Flags/reserved (u32)
+  bytes 16-23  Transfer length (network byte order, u64)
+  bytes 24-31  Source offset (network byte order, u64, ログ用)
+
+注意:
+  ・構造体をそのままwriteするのではなく、固定バイト位置へ明示的にシリアライズ。
+    エンディアンや構造体パディングの影響を避ける。
+  ・u64のホスト/ネットワーク変換は2個のhtonl/ntohl等から実装可能。
+  ・受信側はヘッダーを検証し、受信予定バイト数を確定する。
+  ・ファイルデータの後にACK（成功/失敗＋受信バイト数）を返す。
+  ・ACKはファイルへの全量書き込み完了後に送信する。
+  ・--fsync指定時は同期完了後に成功ACKを返す。
+  ・送信側がバイト数を全部カーネルへ渡したことは受信・保存完了を意味しない。
+
+受信側がEOFに達した時点で予定長未満なら転送失敗。完了判定には必ず
+「受信した合計バイト数 == ヘッダーで宣言した転送長」を使用する。
+必要に応じて送信側からデータ送信終了後 shutdown(sock, SHUT_WR) し、
+Receiverが想定外の追加バイトも検出できる方式を採用する。
+
+5. Sender側の実装順序
+----------------------
+(1) 引数検証
+  ・--offset / --lengthは非負の10進整数としてuint64_tで厳密にパース。
+  ・文字列に余分な文字がないこと、変換時のERANGEを確認。
+  ・length > 0 とする（空ファイルを許すなら仕様に明記）。
+  ・offset + lengthのオーバーフローを加算前に検査。
+
+(2) 入力ファイルをO_RDONLYでopen、fstatで正規ファイルか確認
+  ・source_size >= offset、length <= source_size-offset を確認。
+  ・off_tで表せない位置は拒否。
+  ・送信中に元ファイルが書き換えられない運用とする。
+    ゼロコピー転送は元ファイルが変更されると一貫性が失われ得る。
+  ・必要なら開始/終了時のsize, mtime, inodeを比較。ただし完全な
+    変更検出にはならない。データ完全性を強く要する場合は別途ハッシュを使う。
+
+(3) 宛先へTCP接続
+  ・IPv4を最小構成とし、必要なら後でIPv6追加。
+  ・SO_SNDBUF等は初期状態ではOS自動調整を利用。
+  ・NagleやTCP_CORKを最初から変更せず、実測後に比較。
+
+(4) ヘッダー送信
+  ・固定長ヘッダーをwrite_full()/send_full()で全量送る。
+  ・SIGPIPEによる強制終了を防ぎ、EPIPE等をエラーとして扱う。
+
+(5) 先読みの基本モード
+  ・open後にposix_fadvise(fd, offset, length, POSIX_FADV_SEQUENTIAL)。
+  ・Linux 2.6.32ではPOSIX_FADV_NOREUSEは実質no-opなので不採用。
+  ・当初は追加のreadahead()を行わないautoモードを基本にする。
+  ・手動prefetchを検証する場合は、進行位置より前方の有限窓だけを
+    readahead(fd, future_offset, window_len)する。
+    readaheadはキャッシュ確保や完了を保証する機能ではなく、
+    ファイルシステムメタデータ処理等で待機することもある。
+  ・32GBのうち10GBが別用途でも、最初から22GB分の先読みをしない。
+    32MiB、128MiB、512MiBを比較し、必要なら1GiBを検討。
+
+(6) sendfile()でデータ送信
+  ・off_t current_offset = validated_offset;
+  ・uint64_t remaining = requested_length;
+  ・while (remaining > 0):
+       chunk = min(remaining, configured_chunk, 0x7ffff000);
+       n = sendfile(socket_fd, file_fd, &current_offset, chunk);
+       n > 0 ならremainingを減算し、進捗を更新
+       EINTRなら再試行
+       EAGAIN/EWOULDBLOCKならソケット待機（非blockingを導入した場合）
+       n == 0なのにremaining>0なら早期EOFとして失敗
+       その他のエラーは処理を中断
+  ・Linuxではsendfileの1回当たりの上限は0x7ffff000 bytes。
+    初期のchunkは16MiBなど上限より十分小さくする。
+  ・途中送信時にファイルの末尾到達/元ファイル縮小を検出する。
+
+(7) キャッシュ方針
+  ・デフォルトはカーネル管理に任せる。
+  ・必要なら送信済みの古い領域へPOSIX_FADV_DONTNEEDを試すが、
+    送信直後のページがまだTCP送信キューで利用されている可能性があるため、
+    即座のDONTNEEDを必須機能にしない。
+  ・DONTNEEDは助言であり、解放成功を保証しない。
+    ファイル中の部分ページの扱いにも注意。
+  ・drop_cachesによるシステム全体のキャッシュ破棄は禁止。
+
+(8) 完了処理
+  ・全量送信後に送信方向をshutdown(sock, SHUT_WR)する。
+  ・Receiverの成功/失敗ACKを読み、宣言長と受信実績を照合。
+  ・エラーなら必ず非0終了。成功のみ0終了。
+  ・接続エラー/ソケット切断/システムコールエラーをログへ表示。
+
+6. Receiver側の実装順序
+------------------------
+(1) --bind/--portでlisten/accept（指定IPに限定）
+  ・SO_REUSEADDRは必要なら使用。
+  ・ポートを外部ネットワークへ公開しない。
+  ・受信元IPの許可を指定できるとより安全。
+
+(2) 固定長ヘッダーを全量受信し、magic/version/length等を検証
+  ・最大サイズ制限の設定を推奨。
+  ・0長や異常に大きいデータ長の扱いを明確にする。
+
+(3) 出力先に一時ファイルを作成
+  ・例: output.raw.part.PID。可能ならmkstemp()を使用（mode 0600）。
+  ・パス競合やsymlink攻撃を避ける。
+  ・同名の完成ファイルを勝手に上書きしない。
+  ・送信途中に失敗した場合は.partを残すか削除するかをオプション化。
+
+(4) splice()受信ループ
+  ・pipe()でカーネル内パイプを作る。
+  ・A: splice(socket_fd, NULL, pipe_write, NULL, n, 0)
+  ・B: splice(pipe_read, NULL, file_fd, NULL, transferred, 0)
+  ・必ずAで得たバイト数をBで全量吐き出してから次のAへ進む。
+  ・nは小さく始める（例: 64KiB）。パイプ容量を超えて一度に
+    blocking splice(socket→pipe)を要求すると詰まる可能性があるため、
+    最大要求は実際のパイプ容量以下とする。
+  ・受信残量に合わせてnを制限し、ヘッダー/ACKと混ぜない。
+  ・EINTRや部分転送、早期EOF、ENOSPC、EIOを正しく扱う。
+  ・splice()が環境依存の制約で使えないなら、受信開始時点で
+    recv()+write()モードを選び直せるよう設計する。
+    ストリームの途中まで読み取ってから無条件で先頭へ戻してはいけない。
+
+(5) 完了条件
+  ・宣言した転送長ちょうどを書き込み終えたことを確認。
+  ・受信方向でEOFを確認するか、プロトコルの明確な終端規則を適用。
+  ・--fsync時はfdatasync()/fsync()を呼び成功を確認。
+  ・ファイルをcloseし、完成ファイル名へrenameする。
+  ・強い永続化保証が必要ならrename後の親ディレクトリのfsyncも検討。
+  ・成功ACKを送る。エラーACK時は成功扱いしない。
+
+7. 送受信プロトコル実装上の注意
+--------------------------------
+・データの先頭と終端を固定長ヘッダー+宣言長で管理する。
+・セッションは1ファイル/1接続に限定すると作りやすい。
+・Receiverが成功ACKを返すまでSenderは「完了」と表示しない。
+・ヘッダーへのTCP writeは短い場合がある。全量書き込むループが必要。
+・signal(SIGPIPE, SIG_IGN) 等でSIGPIPE終了を防ぐ。
+・TCP通信は暗号化も認証もない。信頼された隔離LAN＋FW＋bind IPで制限。
+・特に固定先ポートだけを開放し、受信プログラムをrootで動かさない。
+・Senderのファイル範囲が変動しないよう、観測/録画完了後のファイルを使う。
+・圧縮/チェックサムの常時計算はCPU負荷増のため初期版には入れない。
+・単純なバイト数照合はデータ破損を検出できない。必要なら外部sha256で検証。
+・既存のhashcheck等がある場合は、転送後のブロックSHA-256比較に利用できる。
+
+8. コンパイル方法
+------------------
+Sender (GCC 4.4.7):
+  gcc -O2 -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
+      -Wall -Wextra -o fastsend fastsend.c
+
+Receiver (GCC 8.5.0):
+  gcc -O2 -std=gnu99 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
+      -Wall -Wextra -o fastrecv fastrecv.c
+
+複数ソースにした場合はcommon.cも指定する。
+新しいC11 API、新しいglibc関数、io_uring、copy_file_rangeはSenderでは使用しない。
+最適化は-O2から始め、-O3の効果は実測する。
+旧gccで警告なくビルドできることを必須条件とする。
+
+9. ベースラインの比較
+----------------------
+比較は次の3方式以上で実施する。
+  A) 既存: dd | tail | pv | ncat
+  B) 改善dd: dd(バイト位置直接指定) | pv | ncat
+  C) 新実装: fastsend + fastrecv
+
+GNU ddが以下のフラグをサポートするかはSenderで事前確認:
+  dd --help | grep -E 'skip_bytes|count_bytes'
+
+対応していればBの例:
+  dd if=source.raw bs=4M iflag=skip_bytes,count_bytes \
+    skip=604248 count=153600000000 status=none | \
+    pv -s 153600000000 | ncat --send-only RECEIVER_IP 9002
+
+ただし受信方法は従来条件と一致させること。
+環境によってdd 8.xの一部のフラグ・オプションが存在しない可能性あり。
+その場合は利用可能な方法で同じ切り出し範囲を指定して比較する。
+
+10. 動作試験（段階的）
+-----------------------
+[第1段階: 小さなデータ]
+  ・既知内容の1MiBファイルを生成。
+  ・offset=1, length=1、offset=3, length=7など非アライメント境界。
+  ・offset=0、末尾1byte、全長、長さがsource_sizeを超えるケース。
+  ・期待データをdd等で取り出した結果とcmpで全バイト比較。
+
+[第2段階: 1〜10GiB]
+  ・1MiB/16MiB sendfileチャンク比較。
+  ・100MiB境界や4KiB非整列offsetの試験。
+  ・一時ファイルが成功時だけ完成名になること。
+  ・Receiver側の容量不足とSender側の接続失敗を模擬。
+  ・ケーブル抜去や受信プロセス強制終了時に成功表示しないこと。
+
+[第3段階: 実際のRAWファイル]
+  ・例: offset=604248, length=153600000000 bytes
+  ・入力ファイルがoffset+length以上あることを事前確認。
+  ・生成したファイル長をstat --printf='%s\n' output.rawで確認。
+  ・既存hashcheckやsha256sumと参照データで内容検証。
+
+11. 性能測定
+-------------
+評価は速度だけでなくCPU時間を必ず含める。
+各条件を少なくとも3回試す。ディスクキャッシュの有無と空きメモリも記録。
+
+推奨する記録項目:
+  ・転送対象バイト数、実行時間（wall time）、平均MB/s、瞬間MB/s
+  ・Senderのuser CPU seconds、system CPU seconds
+  ・Receiverのuser CPU seconds、system CPU seconds
+  ・CPU秒/GiB = (user + system CPU time) / transferred GiB
+  ・送信元HDD/RAIDのread MB/s, await, util
+  ・受信先HDD/RAIDのwrite MB/s, await, util
+  ・NICリンク速度、Tx/Rx MB/s、再送・dropの有無
+  ・MemAvailable、Cached、Dirty、Writeback等
+
+計測コマンド（存在するものだけ使用）:
+  /usr/bin/time -v ./fastsend ...
+  /usr/bin/time -v ./fastrecv ...
+  iostat -xm 1
+  sar -n DEV 1
+  free -m
+  cat /proc/meminfo
+  ip -s link show
+  ethtool INTERFACE
+  ethtool -k INTERFACE
+
+注: Linux 2.6.32の古い環境ではコマンドや表示項目が異なる場合がある。
+    sysstatパッケージが無ければ /proc/diskstats や /proc/net/dev を利用。
+    /usr/bin/timeが無ければshellのtimeでも測定可能だが詳細は減る。
+
+12. パラメータを増やす順番
+---------------------------
+(1) 先読みなし、sendfile + spliceで動作と正確性を確立。
+(2) 送信chunkを 1/4/16/64 MiB で比較。
+(3) POSIX_FADV_SEQUENTIALのON/OFF比較。
+(4) readahead窓 0/32/128/512 MiB を比較。
+(5) 受信側splice と recv/writeの比較。
+(6) 必要なら送信ソケット設定や書き込み同期方式を比較。
+
+複数のパラメータを同時に変更しないこと。
+CPU時間/GiBが減り、速度が同等以上で、速度の変動が改善する構成を採用。
+
+13. 完了判定
+-------------
+・GCC 4.4.7とGCC 8.5.0で警告なくビルドできる。
+・任意の1byte境界で切り出せ、元データと完全一致する。
+・TCP切断、ディスク満杯、ファイル末尾、権限不足で失敗を検出する。
+・Receiverの成功ACK受信までSenderは成功終了しない。
+・新規プログラムが既存方式より低いCPU秒/GiBを達成するか、
+  同CPU時間で速度または安定性に明確なメリットがある。
+・RAMの別用途10GBに悪影響を出さない。
+・root権限やOS/カーネル更新を必要としない。
+
+14. 実装時に確認する一次資料
+-----------------------------
+  Linux sendfile(2):
+    https://man7.org/linux/man-pages/man2/sendfile.2.html
+  Linux splice(2):
+    https://man7.org/linux/man-pages/man2/splice.2.html
+  Linux readahead(2):
+    https://man7.org/linux/man-pages/man2/readahead.2.html
+  Linux posix_fadvise(2):
+    https://man7.org/linux/man-pages/man2/posix_fadvise.2.html
+  Linux pipe(7):
+    https://man7.org/linux/man-pages/man7/pipe.7.html
+  Linux tcp(7):
+    https://man7.org/linux/man-pages/man7/tcp.7.html
+
+注記:
+  RHEL 6 / RHEL 8は独自パッチ/バックポートを含む場合があるため、
+  細部の挙動は実機で確認すること。性能値は測定前に断定しない。
+
+15. 開発の推奨順序（チェックリスト）
+------------------------------------
+  [ ] 第1版: 固定ヘッダー、Sender sendfile、Receiver recv/write
+  [ ] 基本エラー処理、64bit範囲検証、ACK、受信一時ファイル
+  [ ] 小ファイルの全バイト一致・異常系試験
+  [ ] 第2版: Receiverのspliceモード追加
+  [ ] SenderへPOSIX_FADV_SEQUENTIAL / 進捗表示追加
+  [ ] CPU時間/GiBの測定とsendfileチャンク比較
+  [ ] 必要なら明示的なreadahead窓を追加
+  [ ] 大容量RAW実測、RAM影響の検証、最終パラメータ決定
+
+以上。
