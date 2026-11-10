@@ -18,6 +18,7 @@ uint64_t get64(const unsigned char *);
 int read_full(int, void *, size_t);
 int write_full(int, const void *, size_t);
 double now_sec(void);
+void progress_begin(uint64_t, double);
 void progress(const char *, uint64_t, uint64_t, double, double *, unsigned);
 void progress_clear(void);
 void progress_perror(const char *);

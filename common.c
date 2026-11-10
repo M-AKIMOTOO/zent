@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 int parse_u64(const char *s, uint64_t *v) {
@@ -45,23 +46,36 @@ int write_full(int fd, const void *buf, size_t len) {
 }
 double now_sec(void) { struct timespec ts; if (clock_gettime(CLOCK_MONOTONIC,&ts)<0) return 0; return (double)ts.tv_sec+(double)ts.tv_nsec/1e9; }
 static int progress_tty=-1;
+static int progress_log=0;
 static int progress_visible=0;
+static uint64_t progress_base=0,progress_previous=0;
+static double progress_start=0;
+void progress_begin(uint64_t bytes, double start) {
+ progress_base=progress_previous=bytes; progress_start=start;
+}
 void progress(const char *label, uint64_t done, uint64_t total, double start, double *last, unsigned interval) {
- double t, elapsed;
+ double t, elapsed,rate;
  if (!interval) return;
- if (progress_tty<0) progress_tty=isatty(STDERR_FILENO);
- if (!progress_tty) return;
+ if (progress_tty<0) {
+  const char *setting=getenv("ZENT_PROGRESS_LOG");
+  progress_tty=isatty(STDERR_FILENO);
+  progress_log=setting && !strcmp(setting,"1");
+ }
+ if (!progress_tty && !progress_log) return;
  t=now_sec(); elapsed=t-start;
  if (t-*last>=interval) {
-  fprintf(stderr,"\r\033[K%s %5.1f%% %llu/%llu B | %.1f s | %.1f MiB/s",label,total ? 100.0*(double)done/(double)total : 0.0,(unsigned long long)done,(unsigned long long)total,elapsed>0 ? elapsed : 0.0,elapsed>0 ? (double)done/1048576.0/elapsed : 0.0);
-  fflush(stderr); progress_visible=1; *last=t;
+  rate=done>=progress_previous?(double)(done-progress_previous)/(t-*last):0;
+  fprintf(stderr,"%s%s %5.1f%% %llu/%llu B | %.1f s | %.1f MiB/s now | %.1f MiB/s avg",progress_tty?"\r\033[K":"",label,total ? 100.0*(double)done/(double)total : 0.0,(unsigned long long)done,(unsigned long long)total,elapsed>0 ? elapsed : 0.0,rate/1048576.0,t>progress_start && done>=progress_base ? (double)(done-progress_base)/1048576.0/(t-progress_start) : 0.0);
+  if(rate>0 && total>=done) fprintf(stderr," | ETA %.0f s",(double)(total-done)/rate);
+  if(!progress_tty) fputc('\n',stderr);
+  fflush(stderr); progress_visible=progress_tty; *last=t; progress_previous=done;
  }
 }
 void progress_clear(void) {
  if (progress_visible) { fputs("\r\033[K",stderr); fflush(stderr); progress_visible=0; }
 }
 void progress_perror(const char *message) {
- int saved=errno; progress_clear(); errno=saved; perror(message);
+ int saved=errno; progress_clear(); errno=saved; perror(message); errno=saved;
 }
 void report_timing(uint64_t bytes, double start) {
  double elapsed=now_sec()-start;

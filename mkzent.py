@@ -197,16 +197,29 @@ ZENT=${ZENT:-zent}
 RETRIES=${RETRIES:-30}
 ZENT_RATE_MIB=${ZENT_RATE_MIB:-%(rate_limit)s}
 export ZENT_RATE_MIB
+RESUME=%(resume)s
+TRANSFER_RETRIES=${TRANSFER_RETRIES:-3}
+IDLE_TIMEOUT=${IDLE_TIMEOUT:-120}
+extra=(--progress-sec "${PROGRESS_SEC:-1}")
+if [ "$RESUME" = 1 ]; then
+    extra+=(--resume --transfer-retries "$TRANSFER_RETRIES" --idle-timeout "$IDLE_TIMEOUT")
+fi
 case "$RETRIES" in ''|*[!0-9]*) echo 'invalid RETRIES' >&2; exit 1;; esac
 %(file_check)s
+TOTAL_SCANS=%(total_scans)s
+TOTAL_BYTES=%(total_bytes)s
+finished=0
+printf 'Selected: %%s scans, %%s bytes\n' "$TOTAL_SCANS" "$TOTAL_BYTES"
 while IFS=$'\t' read -r idx target stamp duration offset length outfile; do
     printf '[%%s] %%s %%s: offset=%%s length=%%s\n' "$idx" "$target" "$outfile" "$offset" "$length"
     if [ "$duration" = '-' ]; then
-        "$ZENT" --send --input "$IFILE" --skip 0 --length "$length" --bs 1 --host "$HOST" --port "$PORT" --connect-retries "$RETRIES"
+        "$ZENT" --send --input "$IFILE" --skip 0 --length "$length" --bs 1 --host "$HOST" --port "$PORT" --connect-retries "$RETRIES" "${extra[@]}"
     else
         skip=$(( (offset - BASE) / BS ))
-        "$ZENT" --send --input "$IFILE" --offset "$BASE" --skip "$skip" --length "$duration" --bs "$BS" --host "$HOST" --port "$PORT" --connect-retries "$RETRIES"
+        "$ZENT" --send --input "$IFILE" --offset "$BASE" --skip "$skip" --length "$duration" --bs "$BS" --host "$HOST" --port "$PORT" --connect-retries "$RETRIES" "${extra[@]}"
     fi
+    finished=$((finished + 1))
+    printf 'Completed scans: %%s/%%s\n' "$finished" "$TOTAL_SCANS"
 done <<'FAST_ROWS'
 %(rows)s
 FAST_ROWS
@@ -217,15 +230,43 @@ set -eu
 BIND=%(bind)s
 PORT=%(port)s
 ODIR=%(odir)s
+ODIR=${ZENT_OUTPUT_DIR:-$ODIR}
 ZENT=${ZENT:-zent}
+RESUME=%(resume)s
+TRANSFER_RETRIES=${TRANSFER_RETRIES:-3}
+IDLE_TIMEOUT=${IDLE_TIMEOUT:-120}
+CHECKPOINT_MIB=${CHECKPOINT_MIB:-256}
+RECEIVE_MODE=${RECEIVE_MODE:-splice}
+WRITE_BATCH_MIB=${WRITE_BATCH_MIB:-0}
+PIPE_MIB=${PIPE_MIB:-0}
+extra=(--receive-mode "$RECEIVE_MODE" --progress-sec "${PROGRESS_SEC:-1}")
+if [ "$RESUME" = 1 ]; then
+    extra+=(--resume --transfer-retries "$TRANSFER_RETRIES" --idle-timeout "$IDLE_TIMEOUT" --checkpoint-mib "$CHECKPOINT_MIB")
+fi
+if [ "$WRITE_BATCH_MIB" != 0 ]; then extra+=(--write-batch-mib "$WRITE_BATCH_MIB"); fi
+if [ "$PIPE_MIB" != 0 ]; then extra+=(--pipe-mib "$PIPE_MIB"); fi
 case "$ODIR" in /*) ;; *) ODIR="$(cd -- "$(dirname -- "$0")" && pwd -P)/$ODIR";; esac
 mkdir -p -- "$ODIR"
+TOTAL_SCANS=%(total_scans)s
+TOTAL_BYTES=%(total_bytes)s
+finished=0
+printf 'Selected: %%s scans, %%s bytes\n' "$TOTAL_SCANS" "$TOTAL_BYTES"
 while IFS=$'\t' read -r idx target stamp duration offset length outfile; do
     printf '[%%s] %%s: waiting for %%s, offset=%%s length=%%s\n' "$idx" "$target" "$outfile" "$offset" "$length"
-    "$ZENT" --recv --host "$BIND" --port "$PORT" --output "$ODIR/$outfile" --expect-offset "$offset" --expect-length "$length"
+    "$ZENT" --recv --host "$BIND" --port "$PORT" --output "$ODIR/$outfile" --expect-offset "$offset" --expect-length "$length" "${extra[@]}"
+    finished=$((finished + 1))
+    printf 'Completed scans: %%s/%%s\n' "$finished" "$TOTAL_SCANS"
 done <<'FAST_ROWS'
 %(rows)s
 FAST_ROWS
+'''
+
+RUNNER = r'''#!/bin/bash
+set -eu
+HERE=$(cd -- "$(dirname -- "$0")" && pwd -P)
+exec "${ZENT_RUN:-zent-run}" --host %(ssh_host)s \
+    --sender "$HERE/"%(sender_name)s --receiver "$HERE/"%(receiver_name)s \
+    --odir %(original_odir)s "$@"
 '''
 
 class HelpFormatter(IndentedHelpFormatter):
@@ -245,9 +286,10 @@ def main():
                u'  python mkzent.py --ifile /data/input.vdif --corr 1 \\\n'
                u'    --port 9002 --odir /data/raw\n'
                u'\n'
-               u'生成されるファイル: zent_<入力名>_send.sh、_recv.sh、_manifest.tsv。\n'
+               u'生成されるファイル: zent_<入力名>_send.sh、_recv.sh、_run.sh、_manifest.tsv。\n'
                u'受信スクリプトを --odir へscpで転送します（--no-deploy で省略）。\n'
-               u'一覧を確認し、受信スクリプトを先に起動してください。\n'
+               u'一覧を確認後、_run.sh でSSH経由の受信起動と送信を一括実行できます。\n'
+               u'手動の場合は、受信スクリプトを先に起動してください。\n'
                u'送信側・受信側で zent を用意し、ZENT=/path/to/zent を指定できます。\n'
                u'\n'
                u'範囲: 開始バイト = file-offset + (スキャン開始UTC - 記録開始UTC) × bs、\n'
@@ -266,6 +308,7 @@ def main():
     p.add_option('--ant', metavar='NUM', help=u'DRG使用時は必須。0: YAMAGU32/K、1: YAMAGU34/L。受信ファイル名に使用。')
     p.add_option('--bs', '--data-rate', dest='data_rate', metavar='BYTES', default='256000000', help=u'記録データの1秒あたりのバイト数（既定: 256000000）。')
     p.add_option('--rate-mib', metavar='N', default='0', help=u'送信速度の上限（MiB/秒、0〜1048576、既定: 0で無制限）。生成スクリプトは ZENT_RATE_MIB でも変更可能。')
+    p.add_option('--resume', action='store_true', default=False, help=u'両スクリプトで途中再開と照合済みの完了ファイル再利用を有効にする。両側に更新版zentが必要。')
     p.add_option('--file-offset', metavar='BYTES', default='0', help=u'記録開始時刻に対応するファイル内の基準バイト位置（既定: 0）。')
     p.add_option('--exclude-scan', metavar='LIST', action='append', default=[], help=u'除外するDRG順のスキャン番号または範囲。例: 2,5-7。繰り返し指定可能。')
     p.add_option('--exclude-target', metavar='LIST', action='append', default=[], help=u'除外する天体名をカンマ区切りで指定。大文字・小文字を区別しない。繰り返し指定可能。')
@@ -338,9 +381,10 @@ def main():
         recv_odir = '.'
     bind_addr = opt.bind or receiver_ipv4(opt.host)
     send_addr = opt.host if opt.bind else bind_addr
-    config = dict(host=quote(send_addr), bind=quote(bind_addr), port=quote(str(port)), ifile=quote(os.path.abspath(opt.ifile)), odir=quote(recv_odir), rate=quote(str(rate)), rate_limit=quote(str(rate_limit)), base=quote(str(base)), rows=data, file_check=file_check)
+    config = dict(host=quote(send_addr), bind=quote(bind_addr), port=quote(str(port)), ifile=quote(os.path.abspath(opt.ifile)), odir=quote(recv_odir), rate=quote(str(rate)), rate_limit=quote(str(rate_limit)), base=quote(str(base)), rows=data, file_check=file_check, resume='1' if opt.resume else '0', ssh_host=quote(opt.host), original_odir=quote(opt.odir), sender_name=quote(os.path.basename(prefix+'_send.sh')), receiver_name=quote(os.path.basename(prefix+'_recv.sh')), total_scans=str(len(rows)), total_bytes=str(sum(row[5] for row in rows)))
     files = [(prefix+'_send.sh', SENDER % config, 0o755), (prefix+'_recv.sh', RECEIVER % config, 0o755),
-             (prefix+'_manifest.tsv', 'idx\ttarget\tstart_utc\tduration_sec\toffset_bytes\tlength_bytes\toutfile\n'+data+'\n', 0o644)]
+             (prefix+'_manifest.tsv', 'idx\ttarget\tstart_utc\tduration_sec\toffset_bytes\tlength_bytes\toutfile\n'+data+'\n', 0o644),
+             (prefix+'_run.sh', RUNNER % config, 0o755)]
     write_files(files, opt.force)
     if opt.drg:
         print('Recording start: %s UTC; data rate: %s bytes/s; base offset: %s' % (rawstart, rate, base))
